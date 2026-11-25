@@ -559,9 +559,16 @@ class UserbotManager:
             except Exception as exc:
                 logger.exception("Failed to start userbot client for user %s: %s", user_id, exc)
 
-    async def start_client(self, telegram_user_id: int, session_string: str) -> Client:
+    async def start_client(
+        self,
+        telegram_user_id: int,
+        session_string: str,
+        notify_connected: bool = True,
+        is_new_login: bool = False,
+    ) -> Client:
         """Start (or restart) an in-memory Pyrogram client with all automation handlers."""
         if telegram_user_id in self.active_clients:
+            logger.debug("Stopping existing client for user_id=%s before restart", telegram_user_id)
             await self.stop_client(telegram_user_id)
 
         client = Client(
@@ -577,7 +584,42 @@ class UserbotManager:
 
         self.active_clients[telegram_user_id] = client
         await self.refresh_user_cache(telegram_user_id)
-        logger.info("Started in-memory userbot client for user_id=%s", telegram_user_id)
+
+        tpl_count = len(self._template_cache.get(telegram_user_id, {}))
+        kw_count = len(self._keyword_cache.get(telegram_user_id, []))
+        mention_enabled, mention_tpl = self._mention_cache.get(telegram_user_id, (False, None))
+        logger.info(
+            "Started in-memory userbot client for user_id=%s (templates=%d, keywords=%d, mention_enabled=%s, mention_tpl=%s)",
+            telegram_user_id,
+            tpl_count,
+            kw_count,
+            mention_enabled,
+            mention_tpl,
+        )
+
+        if notify_connected:
+            try:
+                status_line = (
+                    "Your account is now connected!"
+                    if is_new_login
+                    else "Your userbot is online and connected!"
+                )
+                await client.send_message(
+                    chat_id="me",
+                    text=(
+                        f"{status_line}\n"
+                        f"Use /help here in Saved Messages to see all available commands."
+                    ),
+                    parse_mode=ParseMode.DISABLED,
+                )
+                logger.info("Sent connection confirmation to Saved Messages for user_id=%s", telegram_user_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not send connection confirmation to Saved Messages for user_id=%s: %s",
+                    telegram_user_id,
+                    exc,
+                )
+
         return client
 
     async def stop_client(self, telegram_user_id: int) -> None:
@@ -754,10 +796,19 @@ class UserbotManager:
     # -- Handler Registration --
 
     def _attach_handlers(self, client: Client, telegram_user_id: int) -> None:
+        async def _on_saved_command(c: Client, m: Message) -> None:
+            await self._handle_saved_messages_command(c, m, telegram_user_id)
+
+        async def _on_mention(c: Client, m: Message) -> None:
+            await self._handle_mention(c, m, telegram_user_id)
+
+        async def _on_keyword(c: Client, m: Message) -> None:
+            await self._handle_keyword_reply(c, m, telegram_user_id)
+
         # Group 0: Saved Messages control plane
         client.add_handler(
             MessageHandler(
-                lambda c, m: self._handle_saved_messages_command(c, m, telegram_user_id),
+                _on_saved_command,
                 filters.me & filters.chat("me") & filters.text,
             ),
             group=0,
@@ -766,7 +817,7 @@ class UserbotManager:
         # Group 1: Mention auto-reply
         client.add_handler(
             MessageHandler(
-                lambda c, m: self._handle_mention(c, m, telegram_user_id),
+                _on_mention,
                 filters.mentioned & ~filters.me,
             ),
             group=1,
@@ -775,11 +826,12 @@ class UserbotManager:
         # Group 2: Keyword custom text auto-reply
         client.add_handler(
             MessageHandler(
-                lambda c, m: self._handle_keyword_reply(c, m, telegram_user_id),
+                _on_keyword,
                 ~filters.me & filters.text,
             ),
             group=2,
         )
+        logger.debug("Attached async message handlers for user_id=%s", telegram_user_id)
 
     # -- Automation Handlers --
 
@@ -788,19 +840,42 @@ class UserbotManager:
     ) -> None:
         enabled, template_id = self._mention_cache.get(telegram_user_id, (False, None))
         if not enabled or not template_id or not message.chat:
+            logger.debug(
+                "[MENTION] Ignored for user=%s (enabled=%s, template_id=%s)",
+                telegram_user_id,
+                enabled,
+                template_id,
+            )
             return
 
         key = (telegram_user_id, message.chat.id)
         now = time.monotonic()
         if now - self._mention_cooldowns.get(key, 0.0) < MENTION_COOLDOWN_SECONDS:
+            logger.debug(
+                "[MENTION] Cooldown active for user=%s chat=%s",
+                telegram_user_id,
+                message.chat.id,
+            )
             return
 
         template = await self._get_template_cached(telegram_user_id, template_id)
         if not template:
+            logger.warning(
+                "[MENTION] Template %s missing for user=%s",
+                template_id,
+                telegram_user_id,
+            )
             return
 
         self._mention_cooldowns[key] = now
         self._replied_messages.append((telegram_user_id, message.chat.id, message.id))
+        logger.info(
+            "[MENTION] Replying in chat=%s msg=%s with template=%s (user=%s)",
+            message.chat.id,
+            message.id,
+            template_id,
+            telegram_user_id,
+        )
         await send_template_message(
             client,
             message.chat.id,
@@ -833,6 +908,12 @@ class UserbotManager:
             if trigger_lower in incoming_lower:
                 cd_key = (telegram_user_id, message.chat.id, trigger_lower)
                 if now - self._keyword_cooldowns.get(cd_key, 0.0) < KEYWORD_COOLDOWN_SECONDS:
+                    logger.debug(
+                        "[KEYWORD] Cooldown active for user=%s chat=%s trigger=%r",
+                        telegram_user_id,
+                        message.chat.id,
+                        trigger,
+                    )
                     return
 
                 template = await self._get_template_cached(
@@ -843,6 +924,14 @@ class UserbotManager:
 
                 self._keyword_cooldowns[cd_key] = now
                 self._replied_messages.append((telegram_user_id, message.chat.id, message.id))
+                logger.info(
+                    "[KEYWORD] Matched %r in chat=%s msg=%s -> template=%s (user=%s)",
+                    trigger,
+                    message.chat.id,
+                    message.id,
+                    rule.get("template_id"),
+                    telegram_user_id,
+                )
                 await send_template_message(
                     client,
                     message.chat.id,
@@ -862,6 +951,12 @@ class UserbotManager:
 
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
+        logger.info(
+            "[CMD] Received %s from Saved Messages (user=%s, msg_id=%s)",
+            cmd,
+            telegram_user_id,
+            message.id,
+        )
 
         try:
             if cmd == "/help":
@@ -890,6 +985,12 @@ class UserbotManager:
                 await self._cmd_list_replies(message, telegram_user_id)
             elif cmd == "/del_reply":
                 await self._cmd_del_reply(message, telegram_user_id)
+            else:
+                logger.debug("[CMD] Unknown command %s from user=%s", cmd, telegram_user_id)
+                await message.reply_text(
+                    f"Unknown command '{cmd}'. Send /help to see all available commands.",
+                    parse_mode=ParseMode.DISABLED,
+                )
         except Exception as exc:
             logger.exception("Error handling command %s for user %s: %s", cmd, telegram_user_id, exc)
             await message.reply_text(

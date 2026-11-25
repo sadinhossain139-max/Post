@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -26,11 +27,18 @@ from pyrogram.errors import (
 
 from userbot import SupabaseStore, UserbotManager, get_env_config
 
+LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+if LOG_LEVEL > logging.DEBUG:
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
 logger = logging.getLogger("main")
+logger.info("Logging initialized at level=%s", LOG_LEVEL_NAME)
 
 PENDING_AUTH_TTL_SECONDS = 600.0  # 10 minutes
 
@@ -134,7 +142,13 @@ async def _finalize_login(auth_session_id: str, entry: PendingAuth) -> dict[str,
     pending_auths.pop(auth_session_id, None)
     await _safe_disconnect(entry.client)
 
-    await userbot_manager.start_client(me.id, session_string)
+    await userbot_manager.start_client(
+        me.id,
+        session_string,
+        notify_connected=True,
+        is_new_login=True,
+    )
+    logger.info("Authenticated and started userbot for user_id=%s (@%s)", me.id, me.username)
 
     return {
         "status": "authenticated",
