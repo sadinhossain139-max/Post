@@ -9,8 +9,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-# Official Pyrogram 2.0.106 calls asyncio.get_event_loop() at import time,
-# which raises RuntimeError on Python 3.14 if no event loop is set yet.
+# Ensure an event loop exists before importing Pyrogram/Kurigram
+# (protects Python 3.14+ environments where no default loop is set yet).
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from pyrogram import Client
 from pyrogram.errors import (
     BadRequest,
+    FloodPremiumWait,
     FloodWait,
     PasswordHashInvalid,
     PhoneCodeEmpty,
@@ -111,6 +112,10 @@ def _enum_name(val: Any) -> str | None:
     return getattr(val, "name", str(val))
 
 
+def _flood_wait_seconds(exc: Exception) -> int:
+    return int(getattr(exc, "seconds", None) or getattr(exc, "value", 0) or 0)
+
+
 async def _safe_disconnect(client: Client) -> None:
     try:
         if getattr(client, "is_connected", False):
@@ -155,26 +160,44 @@ async def _finalize_login(auth_session_id: str, entry: PendingAuth) -> dict[str,
     """Export session_string, persist to Supabase, tear down temp client, and start live userbot."""
     assert db_store is not None and userbot_manager is not None
 
-    session_string = await entry.client.export_session_string()
-    me = await entry.client.get_me()
+    try:
+        session_string = await entry.client.export_session_string()
+        me = await entry.client.get_me()
 
-    await db_store.upsert_user_session(
-        telegram_user_id=me.id,
-        phone_number=entry.phone_number,
-        username=me.username,
-        session_string=session_string,
-        is_active=True,
-    )
+        await db_store.upsert_user_session(
+            telegram_user_id=me.id,
+            phone_number=entry.phone_number,
+            username=me.username,
+            session_string=session_string,
+            is_active=True,
+        )
 
-    pending_auths.pop(auth_session_id, None)
-    await _safe_disconnect(entry.client)
+        pending_auths.pop(auth_session_id, None)
+        await _safe_disconnect(entry.client)
 
-    await userbot_manager.start_client(
-        me.id,
-        session_string,
-        notify_connected=True,
-        is_new_login=True,
-    )
+        await userbot_manager.start_client(
+            me.id,
+            session_string,
+            notify_connected=True,
+            is_new_login=True,
+            source="user_sessions",
+            username=me.username,
+        )
+    except (FloodWait, FloodPremiumWait) as exc:
+        wait_s = _flood_wait_seconds(exc)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Telegram rate limit hit. Retry after {wait_s} seconds.",
+        ) from exc
+    except RPCError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Telegram RPC error during login finalization: {exc}",
+        ) from exc
+    finally:
+        pending_auths.pop(auth_session_id, None)
+        await _safe_disconnect(entry.client)
+
     logger.info("Authenticated and started userbot for user_id=%s (@%s)", me.id, me.username)
 
     return {
@@ -216,7 +239,7 @@ async def lifespan(_app: FastAPI):
 
     await userbot_manager.start_all_sessions()
     await userbot_manager.reload_scheduled_posts()
-    logger.info("Telegram Userbot Automation Server is ready (Official Pyrogram).")
+    logger.info("Telegram Userbot Automation Server is ready (Kurigram 2.2.27).")
 
     try:
         yield
@@ -237,7 +260,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telegram Userbot Automation Server",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -250,9 +273,19 @@ app = FastAPI(
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     count = len(userbot_manager.active_clients) if userbot_manager else 0
+    by_source = {"user_sessions": 0, "manual_sessions": 0}
+    if userbot_manager:
+        for uid in userbot_manager.active_clients:
+            meta = userbot_manager.session_metadata.get(uid, {})
+            src = meta.get("source", "user_sessions")
+            if src == "manual_sessions":
+                by_source["manual_sessions"] += 1
+            else:
+                by_source["user_sessions"] += 1
     return {
         "status": "ok",
         "active_clients": count,
+        "active_by_source": by_source,
         "pending_auths": len(pending_auths),
     }
 
@@ -262,13 +295,18 @@ async def list_active_sessions() -> dict[str, Any]:
     """Return active in-memory userbot sessions (never exposes session_string)."""
     if not userbot_manager:
         return {"active_clients": 0, "sessions": []}
-    items = [
-        {
-            "telegram_user_id": uid,
-            "is_connected": bool(getattr(client, "is_connected", False)),
-        }
-        for uid, client in userbot_manager.active_clients.items()
-    ]
+    items = []
+    for uid, client in userbot_manager.active_clients.items():
+        meta = userbot_manager.session_metadata.get(uid, {})
+        items.append(
+            {
+                "telegram_user_id": uid,
+                "username": meta.get("username"),
+                "source": meta.get("source", "user_sessions"),
+                "label": meta.get("label"),
+                "is_connected": bool(getattr(client, "is_connected", False)),
+            }
+        )
     return {"active_clients": len(items), "sessions": items}
 
 
@@ -286,6 +324,7 @@ async def auth_send_code(payload: SendCodeRequest) -> dict[str, Any]:
         api_id=config["api_id"],
         api_hash=config["api_hash"],
         in_memory=True,
+        sleep_threshold=30,
         device_model=CLIENT_DEVICE_MODEL,
         system_version=CLIENT_SYSTEM_VERSION,
         app_version=CLIENT_APP_VERSION,
@@ -294,11 +333,12 @@ async def auth_send_code(payload: SendCodeRequest) -> dict[str, Any]:
     try:
         await temp_client.connect()
         sent_code = await temp_client.send_code(phone)
-    except FloodWait as exc:
+    except (FloodWait, FloodPremiumWait) as exc:
         await _safe_disconnect(temp_client)
+        wait_s = _flood_wait_seconds(exc)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Telegram rate limit hit. Retry after {exc.value} seconds.",
+            detail=f"Telegram rate limit hit. Retry after {wait_s} seconds.",
         ) from exc
     except PhoneNumberFlood as exc:
         await _safe_disconnect(temp_client)
@@ -380,10 +420,11 @@ async def auth_resend_code(payload: ResendCodeRequest) -> dict[str, Any]:
             phone_number=entry.phone_number,
             phone_code_hash=entry.phone_code_hash,
         )
-    except FloodWait as exc:
+    except (FloodWait, FloodPremiumWait) as exc:
+        wait_s = _flood_wait_seconds(exc)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Telegram rate limit hit. Retry after {exc.value} seconds.",
+            detail=f"Telegram rate limit hit. Retry after {wait_s} seconds.",
         ) from exc
     except PhoneCodeExpired as exc:
         pending_auths.pop(payload.auth_session_id, None)
@@ -473,10 +514,11 @@ async def auth_verify_otp(payload: VerifyOtpRequest) -> dict[str, Any]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="OTP code has expired. Please request a new code via /auth/send-code.",
         ) from exc
-    except FloodWait as exc:
+    except (FloodWait, FloodPremiumWait) as exc:
+        wait_s = _flood_wait_seconds(exc)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Telegram rate limit hit. Retry after {exc.value} seconds.",
+            detail=f"Telegram rate limit hit. Retry after {wait_s} seconds.",
         ) from exc
     except BadRequest as exc:
         raise HTTPException(
@@ -503,10 +545,11 @@ async def auth_verify_2fa(payload: Verify2FARequest) -> dict[str, Any]:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid 2FA password. Please try again.",
         ) from exc
-    except FloodWait as exc:
+    except (FloodWait, FloodPremiumWait) as exc:
+        wait_s = _flood_wait_seconds(exc)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Telegram rate limit hit. Retry after {exc.value} seconds.",
+            detail=f"Telegram rate limit hit. Retry after {wait_s} seconds.",
         ) from exc
     except BadRequest as exc:
         raise HTTPException(
