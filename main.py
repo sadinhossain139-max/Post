@@ -239,6 +239,7 @@ async def lifespan(_app: FastAPI):
 
     await userbot_manager.start_all_sessions()
     await userbot_manager.reload_scheduled_posts()
+    await userbot_manager.reload_campaigns()
     logger.info("Telegram Userbot Automation Server is ready (Kurigram 2.2.27).")
 
     try:
@@ -260,7 +261,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telegram Userbot Automation Server",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -274,6 +275,7 @@ app = FastAPI(
 async def health_check() -> dict[str, Any]:
     count = len(userbot_manager.active_clients) if userbot_manager else 0
     by_source = {"user_sessions": 0, "manual_sessions": 0}
+    running_campaigns = 0
     if userbot_manager:
         for uid in userbot_manager.active_clients:
             meta = userbot_manager.session_metadata.get(uid, {})
@@ -282,10 +284,14 @@ async def health_check() -> dict[str, Any]:
                 by_source["manual_sessions"] += 1
             else:
                 by_source["user_sessions"] += 1
+        running_campaigns = sum(
+            1 for _, task in userbot_manager._campaign_tasks.values() if not task.done()
+        )
     return {
         "status": "ok",
         "active_clients": count,
         "active_by_source": by_source,
+        "running_campaigns": running_campaigns,
         "pending_auths": len(pending_auths),
     }
 

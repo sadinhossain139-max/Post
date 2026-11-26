@@ -23,14 +23,16 @@ except RuntimeError:
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from pyrogram import Client, filters
-from pyrogram.enums import MessageEntityType, ParseMode, UserStatus
+from pyrogram import Client, filters, raw
+from pyrogram.enums import ChatType, MessageEntityType, ParseMode, UserStatus
 from pyrogram.errors import (
     AuthKeyUnregistered,
+    ChatWriteForbidden,
     FloodPremiumWait,
     FloodWait,
     RPCError,
     SessionRevoked,
+    SlowmodeWait,
     UserDeactivated,
     UserDeactivatedBan,
 )
@@ -42,6 +44,7 @@ from supabase import create_client
 logger = logging.getLogger("userbot")
 
 TEMPLATE_ID_RE = re.compile(r"^TPL-[0-9A-F]{6}$")
+CAMPAIGN_ID_RE = re.compile(r"^CMP-[0-9A-F]{6}$")
 MENTION_COOLDOWN_SECONDS = 30.0
 KEYWORD_COOLDOWN_SECONDS = 15.0
 DEFAULT_OFFLINE_COOLDOWN_SECONDS = 300
@@ -52,11 +55,95 @@ CLIENT_SLEEP_THRESHOLD = 30
 STARTUP_STAGGER_SECONDS = 1.0
 TELEGRAM_SYSTEM_USER_IDS = frozenset({777000, 42777})
 
+MIN_CAMPAIGN_DELAY_SECONDS = 5
+MAX_CAMPAIGN_DELAY_SECONDS = 3600
+ACCOUNT_SEND_PACE_SECONDS = 1.5
+VALID_CAMPAIGN_MODES = frozenset({"buysell", "folder", "keywords", "folder_buysell"})
+DEFAULT_BUYSELL_KEYWORDS: tuple[str, ...] = (
+    "buy",
+    "sell",
+    "buysell",
+    "buy/sell",
+    "buy & sell",
+    "buy and sell",
+    "market",
+    "marketplace",
+    "shop",
+    "store",
+    "trade",
+    "trading",
+    "exchange",
+    "deal",
+    "deals",
+    "bazar",
+    "bazaar",
+    "sale",
+    "sales",
+    "promo",
+    "ads",
+    "advert",
+    "escrow",
+    "vendor",
+    "resell",
+    "wholesale",
+    "stock",
+    "accounts",
+    "service",
+    "services",
+    "crypto",
+    "usdt",
+    "p2p",
+    "otc",
+)
+
 CLIENT_DEVICE_MODEL = os.environ.get("TG_DEVICE_MODEL", "Desktop")
 CLIENT_SYSTEM_VERSION = os.environ.get("TG_SYSTEM_VERSION", "Linux")
 CLIENT_APP_VERSION = os.environ.get("TG_APP_VERSION", "4.16.30")
 
 _UNSET: Any = object()
+
+
+def _matches_group_keywords(
+    title: str | None, username: str | None, keywords: list[str] | tuple[str, ...]
+) -> bool:
+    """Match English buy/sell or custom keywords against group title/username without false positives."""
+    haystack = f"{title or ''} {username or ''}".lower().strip()
+    if not haystack or not keywords:
+        return False
+    for raw_kw in keywords:
+        kw = str(raw_kw).strip().lower()
+        if not kw:
+            continue
+        if len(kw) <= 4 and kw.isalnum():
+            if re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", haystack):
+                return True
+        else:
+            if kw in haystack:
+                return True
+    return False
+
+
+def _extract_peer_chat_id(peer: Any) -> int | None:
+    """Convert raw Telegram InputPeerChannel/InputPeerChat into Pyrogram numeric chat_id."""
+    if peer is None:
+        return None
+    channel_id = getattr(peer, "channel_id", None)
+    if channel_id is not None:
+        return int(f"-100{channel_id}")
+    chat_id = getattr(peer, "chat_id", None)
+    if chat_id is not None:
+        return -int(chat_id)
+    return None
+
+
+def _extract_filter_title(raw_title: Any) -> str:
+    """Extract plain folder title from str or Kurigram TextWithEntities."""
+    if raw_title is None:
+        return ""
+    text = getattr(raw_title, "text", None)
+    if isinstance(text, str):
+        return text.strip()
+    return str(raw_title).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +795,110 @@ class SupabaseStore:
         )
         return bool(res.data)
 
+    # -- campaigns --
+
+    async def create_campaign(
+        self,
+        telegram_user_id: int,
+        name: str,
+        template_id: str,
+        target_mode: str,
+        folder_name: str | None,
+        keywords: list[str],
+        max_groups: int,
+        delay_seconds: int,
+        repeat_interval_minutes: int,
+        target_groups: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        for _ in range(5):
+            cmp_id = f"CMP-{uuid.uuid4().hex[:6].upper()}"
+            existing = await self.get_campaign(cmp_id)
+            if existing is None:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                row: dict[str, Any] = {
+                    "id": cmp_id,
+                    "telegram_user_id": telegram_user_id,
+                    "name": name.strip(),
+                    "template_id": template_id.strip().upper(),
+                    "target_mode": target_mode,
+                    "folder_name": folder_name,
+                    "keywords": keywords,
+                    "max_groups": max(0, int(max_groups)),
+                    "delay_seconds": max(MIN_CAMPAIGN_DELAY_SECONDS, int(delay_seconds)),
+                    "repeat_interval_minutes": max(0, int(repeat_interval_minutes)),
+                    "target_groups": target_groups,
+                    "status": "paused",
+                    "total_sent": 0,
+                    "total_failed": 0,
+                    "updated_at": now_iso,
+                }
+                res = await self._run(
+                    lambda r=row: self._client.table("campaigns").insert(r).execute()
+                )
+                return res.data[0] if res.data else row
+        raise RuntimeError("Failed to generate a unique campaign ID")
+
+    async def get_campaign(
+        self, campaign_id: str, telegram_user_id: int | None = None
+    ) -> dict[str, Any] | None:
+        norm_id = campaign_id.strip().upper()
+
+        def _query() -> Any:
+            q = self._client.table("campaigns").select("*").eq("id", norm_id)
+            if telegram_user_id is not None:
+                q = q.eq("telegram_user_id", telegram_user_id)
+            return q.limit(1).execute()
+
+        res = await self._run(_query)
+        return res.data[0] if res.data else None
+
+    async def list_campaigns(
+        self, telegram_user_id: int | None = None, status_filter: str | None = None
+    ) -> list[dict[str, Any]]:
+        def _query() -> Any:
+            q = (
+                self._client.table("campaigns")
+                .select("*")
+                .order("created_at", desc=True)
+            )
+            if telegram_user_id is not None:
+                q = q.eq("telegram_user_id", telegram_user_id)
+            if status_filter is not None:
+                q = q.eq("status", status_filter)
+            return q.execute()
+
+        res = await self._run(_query)
+        return res.data or []
+
+    async def update_campaign(
+        self,
+        campaign_id: str,
+        updates: dict[str, Any],
+        telegram_user_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        norm_id = campaign_id.strip().upper()
+        payload = {**updates, "updated_at": datetime.now(timezone.utc).isoformat()}
+
+        def _query() -> Any:
+            q = self._client.table("campaigns").update(payload).eq("id", norm_id)
+            if telegram_user_id is not None:
+                q = q.eq("telegram_user_id", telegram_user_id)
+            return q.execute()
+
+        res = await self._run(_query)
+        return res.data[0] if res.data else None
+
+    async def delete_campaign(self, campaign_id: str, telegram_user_id: int) -> bool:
+        norm_id = campaign_id.strip().upper()
+        res = await self._run(
+            lambda: self._client.table("campaigns")
+            .delete()
+            .eq("id", norm_id)
+            .eq("telegram_user_id", telegram_user_id)
+            .execute()
+        )
+        return bool(res.data)
+
 
 # ---------------------------------------------------------------------------
 # Pyrogram / Kurigram In-Memory Userbot Manager
@@ -751,6 +942,13 @@ class UserbotManager:
         self._offline_cooldowns: dict[tuple[int, int], float] = {}
         self._online_status_cache: dict[int, tuple[bool, float]] = {}
         self._replied_messages: deque[tuple[int, int, int]] = deque(maxlen=500)
+
+        # Campaign runtime: campaign_id -> (telegram_user_id, asyncio.Task)
+        self._campaign_tasks: dict[str, tuple[int, asyncio.Task[Any]]] = {}
+        # Interactive campaign creation wizard state: telegram_user_id -> wizard dict
+        self._campaign_wizards: dict[int, dict[str, Any]] = {}
+        # Per-account send lock so multiple simultaneous campaigns pace safely
+        self._account_send_locks: dict[int, asyncio.Lock] = {}
 
     # -- Lifecycle --
 
@@ -1096,6 +1294,20 @@ class UserbotManager:
         return client
 
     async def stop_client(self, telegram_user_id: int) -> None:
+        # Cancel any running campaign tasks for this user (keep DB status for auto-resume)
+        for cmp_id, (owner_id, task) in list(self._campaign_tasks.items()):
+            if owner_id == telegram_user_id:
+                self._campaign_tasks.pop(cmp_id, None)
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        self._campaign_wizards.pop(telegram_user_id, None)
+        self._account_send_locks.pop(telegram_user_id, None)
+
         client = self.active_clients.pop(telegram_user_id, None)
         self.session_metadata.pop(telegram_user_id, None)
         self._online_status_cache.pop(telegram_user_id, None)
@@ -1745,6 +1957,27 @@ class UserbotManager:
         self, client: Client, message: Message, telegram_user_id: int
     ) -> None:
         text = message.text or ""
+
+        # If user is in the middle of the interactive Campaign Wizard, handle replies
+        if telegram_user_id in self._campaign_wizards:
+            if text.strip().lower() == "/cancel":
+                self._campaign_wizards.pop(telegram_user_id, None)
+                await message.reply_text(
+                    "Campaign creation cancelled.", parse_mode=ParseMode.DISABLED
+                )
+                return
+            if not text.startswith("/"):
+                try:
+                    await self._handle_campaign_wizard_step(client, message, telegram_user_id)
+                except Exception as exc:
+                    logger.exception("Error in campaign wizard for user %s: %s", telegram_user_id, exc)
+                    self._campaign_wizards.pop(telegram_user_id, None)
+                    await message.reply_text(
+                        f"Campaign wizard error: {exc}\nWizard reset. Run /new_campaign to try again.",
+                        parse_mode=ParseMode.DISABLED,
+                    )
+                return
+
         if not text.startswith("/"):
             return
 
@@ -1808,6 +2041,30 @@ class UserbotManager:
                 await self._cmd_list_replies(message, telegram_user_id)
             elif cmd == "/del_reply":
                 await self._cmd_del_reply(message, telegram_user_id)
+            elif cmd == "/new_campaign":
+                await self._cmd_new_campaign(client, message, telegram_user_id)
+            elif cmd == "/cancel":
+                await message.reply_text(
+                    "No active setup wizard to cancel.", parse_mode=ParseMode.DISABLED
+                )
+            elif cmd == "/campaigns":
+                await self._cmd_list_campaigns(message, telegram_user_id)
+            elif cmd == "/campaign_start":
+                await self._cmd_campaign_start(client, message, telegram_user_id)
+            elif cmd == "/campaign_pause":
+                await self._cmd_campaign_pause(message, telegram_user_id)
+            elif cmd == "/campaign_block":
+                await self._cmd_campaign_block(message, telegram_user_id)
+            elif cmd == "/campaign_unblock":
+                await self._cmd_campaign_unblock(message, telegram_user_id)
+            elif cmd == "/campaign_groups":
+                await self._cmd_campaign_groups(message, telegram_user_id)
+            elif cmd == "/campaign_rescan":
+                await self._cmd_campaign_rescan(client, message, telegram_user_id)
+            elif cmd == "/campaign_del":
+                await self._cmd_campaign_del(message, telegram_user_id)
+            elif cmd == "/scan_groups":
+                await self._cmd_scan_groups(client, message, telegram_user_id)
             else:
                 logger.debug("[CMD] Unknown command %s from user=%s", cmd, telegram_user_id)
                 await message.reply_text(
@@ -1825,7 +2082,7 @@ class UserbotManager:
             "Userbot Automation Commands (Saved Messages Only)\n"
             "=================================================\n\n"
             "System:\n"
-            "• /status — Show live account, session source, automation & schedule stats\n"
+            "• /status — Show live account, session source, automation & campaign stats\n"
             "• /ping — Check bot response latency\n"
             "• /help — Show this command reference\n\n"
             "Templates (Premium Custom Emojis Supported):\n"
@@ -1833,6 +2090,17 @@ class UserbotManager:
             "• /templates — List all saved templates & emoji counts\n"
             "• /preview <TEMPLATE_ID> — Preview a saved template with emojis\n"
             "• /del_template <TEMPLATE_ID> — Delete a template\n\n"
+            "Campaigns (Buy/Sell & Folder Group Broadcasts):\n"
+            "• /new_campaign — Start step-by-step Campaign Wizard (/cancel to abort)\n"
+            "• /campaigns — List all campaigns, status & sent/failed stats\n"
+            "• /campaign_start <CMP_ID> — Launch or resume a campaign (run multiple at once)\n"
+            "• /campaign_pause <CMP_ID> — Pause a running campaign\n"
+            "• /campaign_block <CMP_ID> — Stop & block a campaign\n"
+            "• /campaign_unblock <CMP_ID> — Unblock a blocked campaign\n"
+            "• /campaign_groups <CMP_ID> — View extracted public & private groups for a campaign\n"
+            "• /campaign_rescan <CMP_ID> — Re-scan & refresh matched groups for a campaign\n"
+            "• /campaign_del <CMP_ID> — Stop & delete a campaign\n"
+            "• /scan_groups [kw1, kw2] — Scan Buy/Sell (or custom) groups & Telegram folders\n\n"
             "Mention Auto-Reply:\n"
             "• /set_mention <TEMPLATE_ID | text | reply> — Enable mention auto-reply\n"
             "• /mention_off — Disable mention auto-reply\n\n"
@@ -1886,6 +2154,11 @@ class UserbotManager:
         tpl_count = len(self._template_cache.get(telegram_user_id, {}))
         kw_count = len(self._keyword_cache.get(telegram_user_id, []))
         active_jobs = await self.db.list_active_scheduled_posts(telegram_user_id)
+        running_campaigns = sum(
+            1
+            for owner_id, task in self._campaign_tasks.values()
+            if owner_id == telegram_user_id and not task.done()
+        )
 
         offline_display = (
             f"ON [{offline_mode}] ({offline_tpl}, cooldown {offline_cd}s)"
@@ -1901,6 +2174,7 @@ class UserbotManager:
             f"Mention Auto-Reply: {'ON (' + str(mention_tpl) + ')' if mention_enabled else 'OFF'}\n"
             f"Welcome Auto-Reply: {'ON (' + str(welcome_tpl) + f', welcomed: {welcomed_count})' if welcome_enabled else f'OFF (welcomed: {welcomed_count})'}\n"
             f"Offline Auto-Reply: {offline_display}\n"
+            f"Running Campaigns: {running_campaigns}\n"
             f"Saved Templates: {tpl_count}\n"
             f"Keyword Rules: {kw_count}\n"
             f"Active Schedules: {len(active_jobs)}\n"
@@ -2605,3 +2879,922 @@ class UserbotManager:
                 f"No keyword rule found for \"{trigger}\".",
                 parse_mode=ParseMode.DISABLED,
             )
+
+    # -----------------------------------------------------------------------
+    # Campaign System (Buy/Sell & Folder Discovery, Multi-Campaign Runner, Wizard)
+    # -----------------------------------------------------------------------
+
+    async def _get_telegram_folders(self, client: Client) -> list[dict[str, Any]]:
+        """Fetch user's Telegram Chat Folders via raw GetDialogFilters."""
+        folders: list[dict[str, Any]] = []
+        try:
+            raw_res = await client.invoke(raw.functions.messages.GetDialogFilters())
+        except Exception as exc:
+            logger.warning("[CAMPAIGN] Failed to fetch Telegram folders: %s", exc)
+            return folders
+
+        filter_items = getattr(raw_res, "filters", raw_res)
+        if not isinstance(filter_items, list):
+            return folders
+
+        for flt in filter_items:
+            flt_id = getattr(flt, "id", None)
+            title = _extract_filter_title(getattr(flt, "title", None))
+            if flt_id is None or not title:
+                continue
+
+            include_ids: set[int] = set()
+            for peer in list(getattr(flt, "include_peers", []) or []) + list(
+                getattr(flt, "pinned_peers", []) or []
+            ):
+                cid = _extract_peer_chat_id(peer)
+                if cid is not None:
+                    include_ids.add(cid)
+
+            exclude_ids: set[int] = set()
+            for peer in list(getattr(flt, "exclude_peers", []) or []):
+                cid = _extract_peer_chat_id(peer)
+                if cid is not None:
+                    exclude_ids.add(cid)
+
+            folders.append(
+                {
+                    "id": int(flt_id),
+                    "title": title,
+                    "include_ids": include_ids,
+                    "exclude_ids": exclude_ids,
+                    "include_all_groups": bool(getattr(flt, "groups", False)),
+                }
+            )
+        return folders
+
+    async def _discover_groups(
+        self,
+        client: Client,
+        target_mode: str,
+        folder_name: str | None = None,
+        keywords: list[str] | None = None,
+        max_groups: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Discover joined public & private groups matching folder and/or Buy/Sell keywords."""
+        selected_folder: dict[str, Any] | None = None
+        if target_mode in ("folder", "folder_buysell"):
+            folders = await self._get_telegram_folders(client)
+            target_folder_norm = (folder_name or "").strip().lower()
+            for f in folders:
+                if f["title"].lower() == target_folder_norm:
+                    selected_folder = f
+                    break
+            if selected_folder is None:
+                return []
+
+        active_keywords: list[str] | tuple[str, ...] = []
+        if target_mode in ("buysell", "folder_buysell"):
+            active_keywords = DEFAULT_BUYSELL_KEYWORDS
+        elif target_mode == "keywords":
+            active_keywords = keywords or list(DEFAULT_BUYSELL_KEYWORDS)
+
+        matched: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+
+        async for dialog in client.get_dialogs():
+            chat = getattr(dialog, "chat", None)
+            if chat is None:
+                continue
+            if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+                continue
+
+            cid = int(chat.id)
+            if cid in seen_ids:
+                continue
+
+            if selected_folder is not None:
+                in_folder = cid in selected_folder["include_ids"] or (
+                    selected_folder["include_all_groups"]
+                    and cid not in selected_folder["exclude_ids"]
+                )
+                if not in_folder:
+                    continue
+
+            title = (chat.title or "Untitled Group").strip()
+            username = getattr(chat, "username", None)
+
+            if active_keywords and not _matches_group_keywords(title, username, active_keywords):
+                continue
+
+            seen_ids.add(cid)
+            matched.append(
+                {
+                    "chat_id": cid,
+                    "title": title,
+                    "username": username,
+                    "is_private": not bool(username),
+                }
+            )
+
+            if max_groups > 0 and len(matched) >= max_groups:
+                break
+
+        return matched
+
+    async def _send_campaign_message(
+        self,
+        client: Client,
+        telegram_user_id: int,
+        chat_id: int,
+        template: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        """Send a campaign template to a target group with per-account pacing and flood handling."""
+        lock = self._account_send_locks.setdefault(telegram_user_id, asyncio.Lock())
+        text = template.get("text", "")
+        entities = deserialize_entities(template.get("entities_json"))
+
+        async with lock:
+            for attempt in range(2):
+                try:
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        entities=entities or None,
+                        parse_mode=ParseMode.DISABLED,
+                    )
+                    await asyncio.sleep(ACCOUNT_SEND_PACE_SECONDS)
+                    return True, None
+                except (FloodWait, FloodPremiumWait) as exc:
+                    wait_sec = int(getattr(exc, "value", 10))
+                    if attempt == 0 and wait_sec <= 120:
+                        logger.warning(
+                            "[CAMPAIGN] FloodWait (%ss) on chat=%s (user=%s); sleeping and retrying once.",
+                            wait_sec,
+                            chat_id,
+                            telegram_user_id,
+                        )
+                        await asyncio.sleep(wait_sec + 1)
+                        continue
+                    return False, f"FloodWait({wait_sec}s)"
+                except SlowmodeWait as exc:
+                    return False, f"SlowmodeWait({getattr(exc, 'value', '?')}s)"
+                except ChatWriteForbidden:
+                    return False, "ChatWriteForbidden"
+                except RPCError as exc:
+                    return False, f"RPCError({type(exc).__name__})"
+                except Exception as exc:
+                    return False, str(exc)
+        return False, "UnknownError"
+
+    def _spawn_campaign_task(self, campaign_id: str, telegram_user_id: int) -> None:
+        """Start an independent background asyncio.Task for a campaign (supports multi-campaign)."""
+        norm_id = campaign_id.strip().upper()
+        existing = self._campaign_tasks.get(norm_id)
+        if existing is not None and not existing[1].done():
+            return
+
+        task = asyncio.create_task(
+            self._run_campaign_loop(norm_id, telegram_user_id),
+            name=f"campaign_{norm_id}",
+        )
+        self._campaign_tasks[norm_id] = (telegram_user_id, task)
+
+    async def _cancel_campaign_task(self, campaign_id: str) -> None:
+        norm_id = campaign_id.strip().upper()
+        entry = self._campaign_tasks.pop(norm_id, None)
+        if entry is not None and not entry[1].done():
+            entry[1].cancel()
+            try:
+                await entry[1]
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def reload_campaigns(self) -> None:
+        """Auto-resume all campaigns with status='running' on server startup."""
+        try:
+            running = await self.db.list_campaigns(status_filter="running")
+        except Exception as exc:
+            logger.warning(
+                "[CAMPAIGN] Could not load campaigns table (run SQL migration if not created yet): %s",
+                exc,
+            )
+            return
+
+        resumed = 0
+        for row in running:
+            uid = int(row["telegram_user_id"])
+            if uid not in self.active_clients:
+                continue
+            self._spawn_campaign_task(row["id"], uid)
+            resumed += 1
+        logger.info("Resumed %d running campaign(s) from Supabase.", resumed)
+
+    async def _run_campaign_loop(self, campaign_id: str, telegram_user_id: int) -> None:
+        """Execute campaign rounds until paused, blocked, deleted, or completed."""
+        logger.info("[CAMPAIGN] Loop started for %s (user=%s)", campaign_id, telegram_user_id)
+        try:
+            while True:
+                client = self.active_clients.get(telegram_user_id)
+                if client is None:
+                    logger.warning(
+                        "[CAMPAIGN] Stopping loop %s: client for user=%s is offline.",
+                        campaign_id,
+                        telegram_user_id,
+                    )
+                    return
+
+                cmp = await self.db.get_campaign(campaign_id, telegram_user_id)
+                if not cmp or cmp.get("status") != "running":
+                    return
+
+                template = await self._get_template_cached(
+                    telegram_user_id, cmp.get("template_id")
+                )
+                if not template:
+                    await self.db.update_campaign(
+                        campaign_id, {"status": "paused"}, telegram_user_id
+                    )
+                    await client.send_message(
+                        chat_id="me",
+                        text=(
+                            f"Campaign {campaign_id} paused automatically: "
+                            f"template {cmp.get('template_id')} not found."
+                        ),
+                        parse_mode=ParseMode.DISABLED,
+                    )
+                    return
+
+                groups: list[dict[str, Any]] = list(cmp.get("target_groups") or [])
+                if not groups:
+                    await self.db.update_campaign(
+                        campaign_id, {"status": "paused"}, telegram_user_id
+                    )
+                    await client.send_message(
+                        chat_id="me",
+                        text=(
+                            f"Campaign {campaign_id} paused: no target groups matched. "
+                            f"Run /campaign_rescan {campaign_id} to refresh."
+                        ),
+                        parse_mode=ParseMode.DISABLED,
+                    )
+                    return
+
+                delay_sec = max(MIN_CAMPAIGN_DELAY_SECONDS, int(cmp.get("delay_seconds", 15)))
+                repeat_min = max(0, int(cmp.get("repeat_interval_minutes", 0)))
+                round_sent = 0
+                round_failed = 0
+                total_sent = int(cmp.get("total_sent", 0))
+                total_failed = int(cmp.get("total_failed", 0))
+
+                for idx, grp in enumerate(groups):
+                    # Re-check DB status so pause/block takes effect immediately
+                    latest = await self.db.get_campaign(campaign_id, telegram_user_id)
+                    if not latest or latest.get("status") != "running":
+                        return
+
+                    chat_id = int(grp["chat_id"])
+                    ok, err = await self._send_campaign_message(
+                        client, telegram_user_id, chat_id, template
+                    )
+                    if ok:
+                        round_sent += 1
+                        total_sent += 1
+                    else:
+                        round_failed += 1
+                        total_failed += 1
+                        logger.debug(
+                            "[CAMPAIGN] %s failed chat=%s (%s): %s",
+                            campaign_id,
+                            chat_id,
+                            grp.get("title"),
+                            err,
+                        )
+
+                    # Sleep delay between groups (skip after last group in round)
+                    if idx < len(groups) - 1:
+                        await asyncio.sleep(delay_sec)
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                next_status = "running" if repeat_min > 0 else "completed"
+                await self.db.update_campaign(
+                    campaign_id,
+                    {
+                        "total_sent": total_sent,
+                        "total_failed": total_failed,
+                        "last_run_at": now_iso,
+                        "status": next_status,
+                    },
+                    telegram_user_id,
+                )
+
+                summary_tail = (
+                    f"Next round in {repeat_min} min."
+                    if repeat_min > 0
+                    else "Campaign completed (one-time run)."
+                )
+                try:
+                    await client.send_message(
+                        chat_id="me",
+                        text=(
+                            f"Campaign {campaign_id} ({cmp['name']}) round finished!\n"
+                            f"Sent: {round_sent} | Failed: {round_failed} | Total Sent: {total_sent}\n"
+                            f"{summary_tail}"
+                        ),
+                        parse_mode=ParseMode.DISABLED,
+                    )
+                except Exception:
+                    pass
+
+                if repeat_min <= 0:
+                    return
+
+                await asyncio.sleep(repeat_min * 60)
+        except asyncio.CancelledError:
+            logger.info("[CAMPAIGN] Loop cancelled for %s", campaign_id)
+            raise
+        except Exception as exc:
+            logger.exception("[CAMPAIGN] Unhandled error in loop %s: %s", campaign_id, exc)
+            try:
+                await self.db.update_campaign(
+                    campaign_id, {"status": "paused"}, telegram_user_id
+                )
+            except Exception:
+                pass
+        finally:
+            current = self._campaign_tasks.get(campaign_id)
+            if current is not None and current[1] is asyncio.current_task():
+                self._campaign_tasks.pop(campaign_id, None)
+
+    # -- Interactive Campaign Creation Wizard --
+
+    async def _cmd_new_campaign(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        templates = await self.db.list_templates(telegram_user_id)
+        if not templates:
+            await message.reply_text(
+                "You need at least one saved template before creating a campaign.\n"
+                "Create one first with: /new <your message with Premium Custom Emojis>",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        self._campaign_wizards[telegram_user_id] = {
+            "step": "name",
+            "data": {},
+        }
+        await message.reply_text(
+            "Campaign Creation Wizard (send /cancel anytime)\n"
+            "===============================================\n\n"
+            "Step 1/6 — Enter a name for this campaign\n"
+            "(Example: BuySell Promo 1)",
+            parse_mode=ParseMode.DISABLED,
+        )
+
+    async def _handle_campaign_wizard_step(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        wiz = self._campaign_wizards.get(telegram_user_id)
+        if not wiz:
+            return
+
+        answer = (message.text or "").strip()
+        step = wiz["step"]
+        data: dict[str, Any] = wiz["data"]
+
+        if step == "name":
+            if len(answer) < 2 or len(answer) > 60:
+                await message.reply_text(
+                    "Campaign name must be 2–60 characters. Please try again:",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+            data["name"] = answer
+            wiz["step"] = "template_id"
+
+            templates = await self.db.list_templates(telegram_user_id)
+            lines = ["Step 2/6 — Send the Template ID to broadcast:\n"]
+            for tpl in templates[:10]:
+                emoji_cnt = count_custom_emojis(tpl.get("entities_json"))
+                preview = tpl["text"].replace("\n", " ")[:40]
+                lines.append(f"• {tpl['id']} (Emojis: {emoji_cnt}) — {preview}")
+            await message.reply_text("\n".join(lines), parse_mode=ParseMode.DISABLED)
+            return
+
+        if step == "template_id":
+            tpl_id = answer.upper()
+            tpl = await self._get_template_cached(telegram_user_id, tpl_id)
+            if not tpl:
+                await message.reply_text(
+                    f"Template '{tpl_id}' not found. Send a valid Template ID (e.g. TPL-4F9A2B):",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+            data["template_id"] = tpl["id"]
+            wiz["step"] = "target_mode"
+
+            folders = await self._get_telegram_folders(client)
+            wiz["folders"] = folders
+            folder_hint = (
+                ", ".join(f'"{f["title"]}"' for f in folders)
+                if folders
+                else "None detected"
+            )
+            await message.reply_text(
+                "Step 3/6 — Choose how to detect target groups (reply 1, 2, 3, or 4):\n\n"
+                "1 — Buy & Sell groups (auto-detect public & private groups with English buy/sell keywords)\n"
+                "2 — Specific Telegram Folder\n"
+                "3 — Custom group-name keywords\n"
+                "4 — Specific Telegram Folder + Buy & Sell keyword filter\n\n"
+                f"Your Telegram Folders: {folder_hint}",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        if step == "target_mode":
+            mode_map = {
+                "1": "buysell",
+                "2": "folder",
+                "3": "keywords",
+                "4": "folder_buysell",
+            }
+            chosen = mode_map.get(answer)
+            if not chosen:
+                await message.reply_text(
+                    "Please reply with 1, 2, 3, or 4:", parse_mode=ParseMode.DISABLED
+                )
+                return
+
+            data["target_mode"] = chosen
+            data["folder_name"] = None
+            data["keywords"] = []
+
+            if chosen in ("folder", "folder_buysell"):
+                folders = wiz.get("folders") or await self._get_telegram_folders(client)
+                wiz["folders"] = folders
+                if not folders:
+                    await message.reply_text(
+                        "No Telegram Folders found on this account. Please pick 1 (Buy & Sell) or 3 (Custom keywords):",
+                        parse_mode=ParseMode.DISABLED,
+                    )
+                    return
+                wiz["step"] = "folder_name"
+                lines = ["Step 3b — Reply with the folder number or exact folder name:\n"]
+                for i, f in enumerate(folders, 1):
+                    lines.append(f"{i}. {f['title']}")
+                await message.reply_text("\n".join(lines), parse_mode=ParseMode.DISABLED)
+                return
+
+            if chosen == "keywords":
+                wiz["step"] = "keywords"
+                await message.reply_text(
+                    "Step 3b — Send comma-separated English keywords to match group names\n"
+                    "(Example: buy, sell, crypto, market, shop):",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+
+            wiz["step"] = "max_groups"
+            await message.reply_text(
+                "Step 4/6 — Max number of groups for this campaign?\n"
+                "Send a number (e.g. 20), or 0 for all matched groups:",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        if step == "folder_name":
+            folders = wiz.get("folders") or []
+            selected_title: str | None = None
+            if answer.isdigit():
+                idx = int(answer) - 1
+                if 0 <= idx < len(folders):
+                    selected_title = folders[idx]["title"]
+            else:
+                for f in folders:
+                    if f["title"].lower() == answer.lower():
+                        selected_title = f["title"]
+                        break
+
+            if not selected_title:
+                await message.reply_text(
+                    "Folder not found. Reply with a valid folder number or exact name:",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+
+            data["folder_name"] = selected_title
+            wiz["step"] = "max_groups"
+            await message.reply_text(
+                f"Selected folder: {selected_title}\n\n"
+                "Step 4/6 — Max number of groups for this campaign?\n"
+                "Send a number (e.g. 20), or 0 for all matched groups:",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        if step == "keywords":
+            kws = [k.strip().lower() for k in answer.split(",") if k.strip()]
+            if not kws:
+                await message.reply_text(
+                    "Please enter at least one keyword (comma-separated):",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+            data["keywords"] = kws
+            wiz["step"] = "max_groups"
+            await message.reply_text(
+                f"Keywords set: {', '.join(kws)}\n\n"
+                "Step 4/6 — Max number of groups for this campaign?\n"
+                "Send a number (e.g. 20), or 0 for all matched groups:",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        if step == "max_groups":
+            try:
+                max_g = int(answer)
+                if max_g < 0:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text(
+                    "Please enter a whole number >= 0 (0 = unlimited):",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+            data["max_groups"] = max_g
+            wiz["step"] = "delay_seconds"
+            await message.reply_text(
+                f"Step 5/6 — Delay between each group in seconds?\n"
+                f"(Minimum {MIN_CAMPAIGN_DELAY_SECONDS}s, recommended 15–30s to prevent FloodWait):",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        if step == "delay_seconds":
+            try:
+                delay_s = int(answer)
+                if delay_s < MIN_CAMPAIGN_DELAY_SECONDS or delay_s > MAX_CAMPAIGN_DELAY_SECONDS:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text(
+                    f"Please enter a number between {MIN_CAMPAIGN_DELAY_SECONDS} and {MAX_CAMPAIGN_DELAY_SECONDS} seconds:",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+            data["delay_seconds"] = delay_s
+            wiz["step"] = "repeat_interval_minutes"
+            await message.reply_text(
+                "Step 6/6 — Repeat interval in minutes between full rounds?\n"
+                "(Example: 60 to repeat every hour, or 0 for a one-time campaign):",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        if step == "repeat_interval_minutes":
+            try:
+                repeat_m = int(answer)
+                if repeat_m < 0:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text(
+                    "Please enter a whole number >= 0 (minutes):",
+                    parse_mode=ParseMode.DISABLED,
+                )
+                return
+
+            data["repeat_interval_minutes"] = repeat_m
+            self._campaign_wizards.pop(telegram_user_id, None)
+
+            await message.reply_text(
+                "Scanning your public & private groups now...",
+                parse_mode=ParseMode.DISABLED,
+            )
+            matched_groups = await self._discover_groups(
+                client=client,
+                target_mode=data["target_mode"],
+                folder_name=data.get("folder_name"),
+                keywords=data.get("keywords"),
+                max_groups=data["max_groups"],
+            )
+
+            cmp = await self.db.create_campaign(
+                telegram_user_id=telegram_user_id,
+                name=data["name"],
+                template_id=data["template_id"],
+                target_mode=data["target_mode"],
+                folder_name=data.get("folder_name"),
+                keywords=data.get("keywords") or [],
+                max_groups=data["max_groups"],
+                delay_seconds=data["delay_seconds"],
+                repeat_interval_minutes=data["repeat_interval_minutes"],
+                target_groups=matched_groups,
+            )
+
+            pub_cnt = sum(1 for g in matched_groups if not g.get("is_private"))
+            priv_cnt = sum(1 for g in matched_groups if g.get("is_private"))
+            sample_lines = []
+            for g in matched_groups[:8]:
+                tag = f"@{g['username']}" if g.get("username") else "Private"
+                sample_lines.append(f"  • {g['title']} ({tag}) [{g['chat_id']}]")
+            if len(matched_groups) > 8:
+                sample_lines.append(f"  ...and {len(matched_groups) - 8} more")
+
+            samples_block = "\n".join(sample_lines) if sample_lines else "  (No matching groups found)"
+            repeat_label = (
+                f"Every {cmp['repeat_interval_minutes']} min"
+                if cmp["repeat_interval_minutes"] > 0
+                else "One-time"
+            )
+
+            await message.reply_text(
+                f"Campaign Created!\n"
+                f"=================\n"
+                f"ID: {cmp['id']}\n"
+                f"Name: {cmp['name']}\n"
+                f"Template: {cmp['template_id']}\n"
+                f"Mode: {cmp['target_mode']}"
+                + (f" (Folder: {cmp['folder_name']})" if cmp.get("folder_name") else "")
+                + f"\nMatched Groups: {len(matched_groups)} (Public: {pub_cnt}, Private: {priv_cnt})\n"
+                f"Delay: {cmp['delay_seconds']}s per group | Repeat: {repeat_label}\n\n"
+                f"Groups:\n{samples_block}\n\n"
+                f"Launch now with:\n/campaign_start {cmp['id']}",
+                parse_mode=ParseMode.DISABLED,
+            )
+
+    # -- Campaign Management Commands --
+
+    async def _cmd_list_campaigns(
+        self, message: Message, telegram_user_id: int
+    ) -> None:
+        rows = await self.db.list_campaigns(telegram_user_id=telegram_user_id)
+        if not rows:
+            await message.reply_text(
+                "No campaigns yet. Use /new_campaign to create one.",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        lines = [f"Your Campaigns ({len(rows)}):"]
+        for c in rows:
+            g_cnt = len(c.get("target_groups") or [])
+            rep = (
+                f"{c['repeat_interval_minutes']}m"
+                if c.get("repeat_interval_minutes", 0) > 0
+                else "once"
+            )
+            lines.append(
+                f"• {c['id']} [{str(c['status']).upper()}] — {c['name']}\n"
+                f"  Tpl: {c['template_id']} | Groups: {g_cnt} | Delay: {c['delay_seconds']}s | Repeat: {rep}\n"
+                f"  Sent: {c.get('total_sent', 0)} | Failed: {c.get('total_failed', 0)}"
+            )
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.DISABLED)
+
+    async def _cmd_campaign_start(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_start <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        cmp = await self.db.get_campaign(cmp_id, telegram_user_id)
+        if not cmp:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        if cmp.get("status") == "blocked":
+            await message.reply_text(
+                f"Campaign {cmp_id} is BLOCKED. Unblock it first with /campaign_unblock {cmp_id}.",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        groups = cmp.get("target_groups") or []
+        if not groups:
+            await message.reply_text(
+                f"Campaign {cmp_id} has 0 matched groups. Run /campaign_rescan {cmp_id} first.",
+                parse_mode=ParseMode.DISABLED,
+            )
+            return
+
+        await self.db.update_campaign(cmp_id, {"status": "running"}, telegram_user_id)
+        self._spawn_campaign_task(cmp_id, telegram_user_id)
+        await message.reply_text(
+            f"Campaign {cmp_id} ({cmp['name']}) LAUNCHED!\n"
+            f"Broadcasting {cmp['template_id']} to {len(groups)} group(s) "
+            f"with {cmp['delay_seconds']}s delay.",
+            parse_mode=ParseMode.DISABLED,
+        )
+
+    async def _cmd_campaign_pause(
+        self, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_pause <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        cmp = await self.db.get_campaign(cmp_id, telegram_user_id)
+        if not cmp:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        await self.db.update_campaign(cmp_id, {"status": "paused"}, telegram_user_id)
+        await self._cancel_campaign_task(cmp_id)
+        await message.reply_text(
+            f"Campaign {cmp_id} PAUSED.", parse_mode=ParseMode.DISABLED
+        )
+
+    async def _cmd_campaign_block(
+        self, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_block <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        cmp = await self.db.get_campaign(cmp_id, telegram_user_id)
+        if not cmp:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        await self.db.update_campaign(cmp_id, {"status": "blocked"}, telegram_user_id)
+        await self._cancel_campaign_task(cmp_id)
+        await message.reply_text(
+            f"Campaign {cmp_id} STOPPED & BLOCKED.\n"
+            f"Use /campaign_unblock {cmp_id} to allow launching again.",
+            parse_mode=ParseMode.DISABLED,
+        )
+
+    async def _cmd_campaign_unblock(
+        self, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_unblock <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        cmp = await self.db.get_campaign(cmp_id, telegram_user_id)
+        if not cmp:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        await self.db.update_campaign(cmp_id, {"status": "paused"}, telegram_user_id)
+        await message.reply_text(
+            f"Campaign {cmp_id} UNBLOCKED (status: paused).\n"
+            f"Launch with /campaign_start {cmp_id}.",
+            parse_mode=ParseMode.DISABLED,
+        )
+
+    async def _cmd_campaign_groups(
+        self, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_groups <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        cmp = await self.db.get_campaign(cmp_id, telegram_user_id)
+        if not cmp:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        groups = cmp.get("target_groups") or []
+        if not groups:
+            await message.reply_text(
+                f"Campaign {cmp_id} has 0 matched groups.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        lines = [f"Matched Groups for {cmp_id} ({len(groups)}):"]
+        for i, g in enumerate(groups[:40], 1):
+            tag = f"@{g['username']}" if g.get("username") else "Private"
+            lines.append(f"{i}. {g['title']} ({tag}) | {g['chat_id']}")
+        if len(groups) > 40:
+            lines.append(f"...and {len(groups) - 40} more groups.")
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.DISABLED)
+
+    async def _cmd_campaign_rescan(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_rescan <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        cmp = await self.db.get_campaign(cmp_id, telegram_user_id)
+        if not cmp:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        await message.reply_text(
+            f"Rescanning groups for {cmp_id}...", parse_mode=ParseMode.DISABLED
+        )
+        matched = await self._discover_groups(
+            client=client,
+            target_mode=cmp["target_mode"],
+            folder_name=cmp.get("folder_name"),
+            keywords=cmp.get("keywords"),
+            max_groups=int(cmp.get("max_groups", 0)),
+        )
+        await self.db.update_campaign(
+            cmp_id, {"target_groups": matched}, telegram_user_id
+        )
+        pub_cnt = sum(1 for g in matched if not g.get("is_private"))
+        priv_cnt = sum(1 for g in matched if g.get("is_private"))
+        await message.reply_text(
+            f"Rescan complete for {cmp_id}!\n"
+            f"Matched Groups: {len(matched)} (Public: {pub_cnt}, Private: {priv_cnt})",
+            parse_mode=ParseMode.DISABLED,
+        )
+
+    async def _cmd_campaign_del(
+        self, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /campaign_del <CMP_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        cmp_id = parts[1].strip().upper()
+        await self._cancel_campaign_task(cmp_id)
+        deleted = await self.db.delete_campaign(cmp_id, telegram_user_id)
+        if deleted:
+            await message.reply_text(
+                f"Stopped and deleted campaign {cmp_id}.", parse_mode=ParseMode.DISABLED
+            )
+        else:
+            await message.reply_text(
+                f"Campaign {cmp_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+
+    async def _cmd_scan_groups(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        custom_kws = (
+            [k.strip().lower() for k in parts[1].split(",") if k.strip()]
+            if len(parts) > 1 and parts[1].strip()
+            else None
+        )
+        target_mode = "keywords" if custom_kws else "buysell"
+
+        await message.reply_text(
+            "Scanning your Buy/Sell groups & Telegram folders...",
+            parse_mode=ParseMode.DISABLED,
+        )
+        folders = await self._get_telegram_folders(client)
+        matched = await self._discover_groups(
+            client=client,
+            target_mode=target_mode,
+            keywords=custom_kws,
+            max_groups=0,
+        )
+
+        pub_cnt = sum(1 for g in matched if not g.get("is_private"))
+        priv_cnt = sum(1 for g in matched if g.get("is_private"))
+        folder_names = ", ".join(f["title"] for f in folders) if folders else "None"
+
+        lines = [
+            f"Group Scan Results ({'Custom Keywords' if custom_kws else 'Buy & Sell Detector'})",
+            "================================================",
+            f"Telegram Folders: {folder_names}",
+            f"Matched Groups: {len(matched)} (Public: {pub_cnt}, Private: {priv_cnt})\n",
+        ]
+        for i, g in enumerate(matched[:35], 1):
+            tag = f"@{g['username']}" if g.get("username") else "Private"
+            lines.append(f"{i}. {g['title']} ({tag}) | {g['chat_id']}")
+        if len(matched) > 35:
+            lines.append(f"...and {len(matched) - 35} more groups.")
+        lines.append("\nStart a campaign anytime with /new_campaign")
+
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.DISABLED)
+
