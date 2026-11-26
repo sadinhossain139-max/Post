@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -7,6 +8,13 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+
+# Official Pyrogram 2.0.106 calls asyncio.get_event_loop() at import time,
+# which raises RuntimeError on Python 3.14 if no event loop is set yet.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -17,15 +25,24 @@ from pyrogram.errors import (
     BadRequest,
     FloodWait,
     PasswordHashInvalid,
+    PhoneCodeEmpty,
     PhoneCodeExpired,
     PhoneCodeInvalid,
     PhoneNumberBanned,
+    PhoneNumberFlood,
     PhoneNumberInvalid,
     RPCError,
     SessionPasswordNeeded,
 )
 
-from userbot import SupabaseStore, UserbotManager, get_env_config
+from userbot import (
+    CLIENT_APP_VERSION,
+    CLIENT_DEVICE_MODEL,
+    CLIENT_SYSTEM_VERSION,
+    SupabaseStore,
+    UserbotManager,
+    get_env_config,
+)
 
 LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
@@ -50,6 +67,10 @@ PENDING_AUTH_TTL_SECONDS = 600.0  # 10 minutes
 
 class SendCodeRequest(BaseModel):
     phone_number: str = Field(..., min_length=5, examples=["+8801700000000"])
+
+
+class ResendCodeRequest(BaseModel):
+    auth_session_id: str = Field(..., min_length=1)
 
 
 class VerifyOtpRequest(BaseModel):
@@ -82,6 +103,12 @@ config: dict[str, Any] = {}
 scheduler: AsyncIOScheduler | None = None
 db_store: SupabaseStore | None = None
 userbot_manager: UserbotManager | None = None
+
+
+def _enum_name(val: Any) -> str | None:
+    if val is None:
+        return None
+    return getattr(val, "name", str(val))
 
 
 async def _safe_disconnect(client: Client) -> None:
@@ -189,7 +216,7 @@ async def lifespan(_app: FastAPI):
 
     await userbot_manager.start_all_sessions()
     await userbot_manager.reload_scheduled_posts()
-    logger.info("Telegram Userbot Automation Server is ready.")
+    logger.info("Telegram Userbot Automation Server is ready (Official Pyrogram).")
 
     try:
         yield
@@ -210,20 +237,39 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telegram Userbot Automation Server",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 
 # ---------------------------------------------------------------------------
-# Health Check Endpoint
+# Health & Status Endpoints
 # ---------------------------------------------------------------------------
 
 
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     count = len(userbot_manager.active_clients) if userbot_manager else 0
-    return {"status": "ok", "active_clients": count}
+    return {
+        "status": "ok",
+        "active_clients": count,
+        "pending_auths": len(pending_auths),
+    }
+
+
+@app.get("/sessions")
+async def list_active_sessions() -> dict[str, Any]:
+    """Return active in-memory userbot sessions (never exposes session_string)."""
+    if not userbot_manager:
+        return {"active_clients": 0, "sessions": []}
+    items = [
+        {
+            "telegram_user_id": uid,
+            "is_connected": bool(getattr(client, "is_connected", False)),
+        }
+        for uid, client in userbot_manager.active_clients.items()
+    ]
+    return {"active_clients": len(items), "sessions": items}
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +286,9 @@ async def auth_send_code(payload: SendCodeRequest) -> dict[str, Any]:
         api_id=config["api_id"],
         api_hash=config["api_hash"],
         in_memory=True,
+        device_model=CLIENT_DEVICE_MODEL,
+        system_version=CLIENT_SYSTEM_VERSION,
+        app_version=CLIENT_APP_VERSION,
     )
 
     try:
@@ -250,6 +299,12 @@ async def auth_send_code(payload: SendCodeRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Telegram rate limit hit. Retry after {exc.value} seconds.",
+        ) from exc
+    except PhoneNumberFlood as exc:
+        await _safe_disconnect(temp_client)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTP attempts for this phone number. Wait before requesting again.",
         ) from exc
     except PhoneNumberInvalid as exc:
         await _safe_disconnect(temp_client)
@@ -291,11 +346,100 @@ async def auth_send_code(payload: SendCodeRequest) -> dict[str, Any]:
         created_at=time.monotonic(),
     )
 
+    delivery_type = _enum_name(getattr(sent_code, "type", None))
+    next_type = _enum_name(getattr(sent_code, "next_type", None))
+    timeout = getattr(sent_code, "timeout", None)
+
+    logger.info(
+        "[AUTH] Sent OTP for phone=%s...%s | session=%s | delivery=%s | next_type=%s | timeout=%s",
+        phone[:4],
+        phone[-3:],
+        auth_session_id,
+        delivery_type,
+        next_type,
+        timeout,
+    )
+
     return {
         "status": "code_sent",
         "auth_session_id": auth_session_id,
+        "code_delivery_type": delivery_type,
+        "next_type": next_type,
+        "timeout": timeout,
         "next_step": "/auth/verify-otp",
     }
+
+
+@app.post("/auth/resend-code")
+async def auth_resend_code(payload: ResendCodeRequest) -> dict[str, Any]:
+    """Request Telegram to resend the OTP using its next delivery method (e.g. SMS/call)."""
+    entry = await _get_valid_pending_auth(payload.auth_session_id)
+
+    try:
+        sent_code = await entry.client.resend_code(
+            phone_number=entry.phone_number,
+            phone_code_hash=entry.phone_code_hash,
+        )
+    except FloodWait as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Telegram rate limit hit. Retry after {exc.value} seconds.",
+        ) from exc
+    except PhoneCodeExpired as exc:
+        pending_auths.pop(payload.auth_session_id, None)
+        await _safe_disconnect(entry.client)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OTP session expired. Start again with /auth/send-code.",
+        ) from exc
+    except BadRequest as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Telegram rejected resend_code: {exc}",
+        ) from exc
+    except RPCError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Telegram RPC error: {exc}",
+        ) from exc
+
+    entry.phone_code_hash = sent_code.phone_code_hash
+    entry.created_at = time.monotonic()
+
+    delivery_type = _enum_name(getattr(sent_code, "type", None))
+    next_type = _enum_name(getattr(sent_code, "next_type", None))
+    timeout = getattr(sent_code, "timeout", None)
+
+    logger.info(
+        "[AUTH] Resent OTP for session=%s | delivery=%s | next_type=%s | timeout=%s",
+        payload.auth_session_id,
+        delivery_type,
+        next_type,
+        timeout,
+    )
+
+    return {
+        "status": "code_resent",
+        "auth_session_id": payload.auth_session_id,
+        "code_delivery_type": delivery_type,
+        "next_type": next_type,
+        "timeout": timeout,
+        "next_step": "/auth/verify-otp",
+    }
+
+
+@app.post("/auth/cancel")
+async def auth_cancel(payload: ResendCodeRequest) -> dict[str, Any]:
+    """Cancel and disconnect an in-progress auth session."""
+    entry = pending_auths.pop(payload.auth_session_id, None)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Auth session not found.",
+        )
+    await _safe_disconnect(entry.client)
+    logger.info("[AUTH] Cancelled pending auth session %s", payload.auth_session_id)
+    return {"status": "cancelled", "auth_session_id": payload.auth_session_id}
 
 
 @app.post("/auth/verify-otp")
@@ -310,14 +454,14 @@ async def auth_verify_otp(payload: VerifyOtpRequest) -> dict[str, Any]:
             phone_code=code,
         )
     except SessionPasswordNeeded:
-        # Refresh TTL while waiting for 2FA password
         entry.created_at = time.monotonic()
+        logger.info("[AUTH] 2FA required for session=%s", payload.auth_session_id)
         return {
             "status": "2fa_required",
             "auth_session_id": payload.auth_session_id,
             "next_step": "/auth/verify-2fa",
         }
-    except PhoneCodeInvalid as exc:
+    except (PhoneCodeInvalid, PhoneCodeEmpty) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid OTP code. Please check the code and try again.",

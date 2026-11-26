@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+# Official Pyrogram 2.0.106 calls asyncio.get_event_loop() at import time,
+# which raises RuntimeError on Python 3.14 if no event loop is set yet.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -34,6 +41,10 @@ logger = logging.getLogger("userbot")
 TEMPLATE_ID_RE = re.compile(r"^TPL-[0-9A-F]{6}$")
 MENTION_COOLDOWN_SECONDS = 30.0
 KEYWORD_COOLDOWN_SECONDS = 15.0
+
+CLIENT_DEVICE_MODEL = os.environ.get("TG_DEVICE_MODEL", "Desktop")
+CLIENT_SYSTEM_VERSION = os.environ.get("TG_SYSTEM_VERSION", "Linux")
+CLIENT_APP_VERSION = os.environ.get("TG_APP_VERSION", "4.16.30")
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +588,9 @@ class UserbotManager:
             api_hash=self.api_hash,
             session_string=session_string,
             in_memory=True,
+            device_model=CLIENT_DEVICE_MODEL,
+            system_version=CLIENT_SYSTEM_VERSION,
+            app_version=CLIENT_APP_VERSION,
         )
 
         self._attach_handlers(client, telegram_user_id)
@@ -961,6 +975,12 @@ class UserbotManager:
         try:
             if cmd == "/help":
                 await self._cmd_help(message)
+            elif cmd == "/ping":
+                await self._cmd_ping(message)
+            elif cmd == "/status":
+                await self._cmd_status(client, message, telegram_user_id)
+            elif cmd == "/preview":
+                await self._cmd_preview_template(client, message, telegram_user_id)
             elif cmd == "/new":
                 await self._cmd_new_template(client, message, telegram_user_id)
             elif cmd == "/templates":
@@ -1001,9 +1021,14 @@ class UserbotManager:
         help_text = (
             "Userbot Automation Commands (Saved Messages Only)\n"
             "=================================================\n\n"
+            "System:\n"
+            "• /status — Show live account, automation & schedule stats\n"
+            "• /ping — Check bot response latency\n"
+            "• /help — Show this command reference\n\n"
             "Templates (Premium Custom Emojis Supported):\n"
             "• /new <text with emojis> — Save a new template (or reply to any message with /new)\n"
             "• /templates — List all saved templates & emoji counts\n"
+            "• /preview <TEMPLATE_ID> — Preview a saved template with emojis\n"
             "• /del_template <TEMPLATE_ID> — Delete a template\n\n"
             "Mention Auto-Reply:\n"
             "• /set_mention <TEMPLATE_ID> — Enable mention auto-reply with a template\n"
@@ -1018,10 +1043,57 @@ class UserbotManager:
             "• /set_reply <keyword> | <TEMPLATE_ID> — Bind keyword to a template\n"
             "• /set_reply <keyword> | <text with emojis> — Bind keyword to inline custom text\n"
             "• /list_replies — List all keyword auto-reply rules\n"
-            "• /del_reply <keyword> — Delete a keyword rule\n\n"
-            "• /help — Show this command reference"
+            "• /del_reply <keyword> — Delete a keyword rule"
         )
         await message.reply_text(help_text, parse_mode=ParseMode.DISABLED)
+
+    async def _cmd_ping(self, message: Message) -> None:
+        start = time.monotonic()
+        sent = await message.reply_text("Pong!", parse_mode=ParseMode.DISABLED)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        await sent.edit_text(f"Pong! ({elapsed_ms} ms)", parse_mode=ParseMode.DISABLED)
+
+    async def _cmd_status(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        me = await client.get_me()
+        mention_enabled, mention_tpl = self._mention_cache.get(telegram_user_id, (False, None))
+        tpl_count = len(self._template_cache.get(telegram_user_id, {}))
+        kw_count = len(self._keyword_cache.get(telegram_user_id, []))
+        active_jobs = await self.db.list_active_scheduled_posts(telegram_user_id)
+
+        status_text = (
+            "Userbot Status\n"
+            "==============\n"
+            f"Account: {me.first_name or ''} (@{me.username or 'none'}) [{me.id}]\n"
+            f"Mention Auto-Reply: {'ON (' + str(mention_tpl) + ')' if mention_enabled else 'OFF'}\n"
+            f"Saved Templates: {tpl_count}\n"
+            f"Keyword Rules: {kw_count}\n"
+            f"Active Schedules: {len(active_jobs)}\n"
+            f"Timezone: {self.tz.key}\n"
+            f"Active Clients on Server: {len(self.active_clients)}"
+        )
+        await message.reply_text(status_text, parse_mode=ParseMode.DISABLED)
+
+    async def _cmd_preview_template(
+        self, client: Client, message: Message, telegram_user_id: int
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "Usage: /preview <TEMPLATE_ID>", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        tpl_id = parts[1].strip().upper()
+        tpl = await self._get_template_cached(telegram_user_id, tpl_id)
+        if not tpl:
+            await message.reply_text(
+                f"Template {tpl_id} not found.", parse_mode=ParseMode.DISABLED
+            )
+            return
+
+        await send_template_message(client, "me", tpl)
 
     async def _cmd_new_template(
         self, client: Client, message: Message, telegram_user_id: int
