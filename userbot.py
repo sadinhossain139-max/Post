@@ -398,14 +398,17 @@ class SupabaseStore:
         username: str | None,
         session_string: str,
         is_active: bool = True,
+        owner_user_id: int | None = None,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "telegram_user_id": telegram_user_id,
             "phone_number": phone_number,
             "username": username,
             "session_string": session_string,
             "is_active": is_active,
         }
+        if owner_user_id is not None:
+            payload["owner_user_id"] = owner_user_id
         res = await self._run(
             lambda: self._client.table("user_sessions")
             .upsert(payload, on_conflict="telegram_user_id")
@@ -898,6 +901,125 @@ class SupabaseStore:
             .execute()
         )
         return bool(res.data)
+
+    # -- bot_users & multi-user isolation --
+
+    async def upsert_bot_user(
+        self,
+        owner_user_id: int,
+        username: str | None = None,
+        first_name: str | None = None,
+    ) -> dict[str, Any]:
+        existing = await self.get_bot_user(owner_user_id)
+        if existing:
+            res = await self._run(
+                lambda: self._client.table("bot_users")
+                .update(
+                    {
+                        "username": username,
+                        "first_name": first_name,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                .eq("owner_user_id", owner_user_id)
+                .execute()
+            )
+            return res.data[0] if res.data else existing
+
+        payload = {
+            "owner_user_id": owner_user_id,
+            "username": username,
+            "first_name": first_name,
+            "max_accounts": 1,
+        }
+        res = await self._run(
+            lambda: self._client.table("bot_users").insert(payload).execute()
+        )
+        return res.data[0] if res.data else payload
+
+    async def get_bot_user(self, owner_user_id: int) -> dict[str, Any] | None:
+        res = await self._run(
+            lambda: self._client.table("bot_users")
+            .select("*")
+            .eq("owner_user_id", owner_user_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
+    async def insert_manual_session_for_owner(
+        self,
+        owner_user_id: int,
+        session_string: str,
+        label: str | None,
+        telegram_user_id: int,
+        username: str | None,
+    ) -> dict[str, Any]:
+        payload = {
+            "owner_user_id": owner_user_id,
+            "session_string": session_string.strip(),
+            "label": label or "NexaPilot",
+            "telegram_user_id": telegram_user_id,
+            "username": username,
+            "is_active": True,
+            "last_error": None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        res = await self._run(
+            lambda: self._client.table("manual_sessions").insert(payload).execute()
+        )
+        return res.data[0] if res.data else payload
+
+    async def get_owner_accounts(self, owner_user_id: int) -> list[dict[str, Any]]:
+        """Return all active userbot accounts strictly owned by owner_user_id."""
+        res_otp = await self._run(
+            lambda: self._client.table("user_sessions")
+            .select("telegram_user_id,phone_number,username,is_active,created_at")
+            .eq("owner_user_id", owner_user_id)
+            .eq("is_active", True)
+            .execute()
+        )
+        res_manual = await self._run(
+            lambda: self._client.table("manual_sessions")
+            .select("id,telegram_user_id,username,label,is_active,created_at")
+            .eq("owner_user_id", owner_user_id)
+            .eq("is_active", True)
+            .execute()
+        )
+
+        accounts: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in res_otp.data or []:
+            uid = row.get("telegram_user_id")
+            if uid is not None and int(uid) not in seen:
+                seen.add(int(uid))
+                accounts.append({**row, "source": "user_sessions"})
+        for row in res_manual.data or []:
+            uid = row.get("telegram_user_id")
+            if uid is not None and int(uid) not in seen:
+                seen.add(int(uid))
+                accounts.append({**row, "source": "manual_sessions"})
+        return accounts
+
+    async def deactivate_owner_account(
+        self, owner_user_id: int, telegram_user_id: int
+    ) -> bool:
+        """Strictly deactivate an account owned by owner_user_id."""
+        r1 = await self._run(
+            lambda: self._client.table("user_sessions")
+            .update({"is_active": False})
+            .eq("owner_user_id", owner_user_id)
+            .eq("telegram_user_id", telegram_user_id)
+            .execute()
+        )
+        r2 = await self._run(
+            lambda: self._client.table("manual_sessions")
+            .update({"is_active": False})
+            .eq("owner_user_id", owner_user_id)
+            .eq("telegram_user_id", telegram_user_id)
+            .execute()
+        )
+        return bool(r1.data or r2.data)
 
 
 # ---------------------------------------------------------------------------

@@ -104,6 +104,7 @@ config: dict[str, Any] = {}
 scheduler: AsyncIOScheduler | None = None
 db_store: SupabaseStore | None = None
 userbot_manager: UserbotManager | None = None
+nexapilot_bot: Any = None
 
 
 def _enum_name(val: Any) -> str | None:
@@ -137,6 +138,8 @@ async def cleanup_expired_pending_auths() -> None:
         if entry is not None:
             await _safe_disconnect(entry.client)
             logger.info("Cleaned up expired pending auth session %s.", sid)
+    if nexapilot_bot is not None:
+        await nexapilot_bot.cleanup_expired_logins()
 
 
 async def _get_valid_pending_auth(auth_session_id: str) -> PendingAuth:
@@ -214,7 +217,7 @@ async def _finalize_login(auth_session_id: str, entry: PendingAuth) -> dict[str,
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global config, scheduler, db_store, userbot_manager
+    global config, scheduler, db_store, userbot_manager, nexapilot_bot
 
     config = get_env_config()
     tz = config["timezone"]
@@ -240,12 +243,36 @@ async def lifespan(_app: FastAPI):
     await userbot_manager.start_all_sessions()
     await userbot_manager.reload_scheduled_posts()
     await userbot_manager.reload_campaigns()
-    logger.info("Telegram Userbot Automation Server is ready (Kurigram 2.2.27).")
+
+    bot_token = os.environ.get("BOT_TOKEN", "").strip()
+    if bot_token:
+        try:
+            from bot import NexaPilotBot
+
+            nexapilot_bot = NexaPilotBot(
+                bot_token=bot_token,
+                api_id=config["api_id"],
+                api_hash=config["api_hash"],
+                db=db_store,
+                manager=userbot_manager,
+            )
+            await nexapilot_bot.start()
+        except Exception as exc:
+            logger.exception("Failed to start NexaPilot ftmgram bot: %s", exc)
+            nexapilot_bot = None
+    else:
+        logger.info("BOT_TOKEN not set; running userbot backend without NexaPilot bot.")
+
+    logger.info("NexaPilot Userbot Automation Server is ready (Kurigram + ftmgram).")
 
     try:
         yield
     finally:
-        logger.info("Shutting down Telegram Userbot Automation Server...")
+        logger.info("Shutting down NexaPilot Userbot Automation Server...")
+        if nexapilot_bot is not None:
+            await nexapilot_bot.stop()
+            nexapilot_bot = None
+
         for sid in list(pending_auths.keys()):
             entry = pending_auths.pop(sid, None)
             if entry is not None:
@@ -260,8 +287,8 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="Telegram Userbot Automation Server",
-    version="1.3.0",
+    title="NexaPilot — Telegram Userbot Automation Server",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -289,6 +316,7 @@ async def health_check() -> dict[str, Any]:
         )
     return {
         "status": "ok",
+        "bot_running": bool(nexapilot_bot and nexapilot_bot.is_running),
         "active_clients": count,
         "active_by_source": by_source,
         "running_campaigns": running_campaigns,
