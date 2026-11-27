@@ -16,7 +16,7 @@ except RuntimeError:
 
 from ftmgram import Client as BotClient
 from ftmgram import filters as bot_filters
-from ftmgram.enums import MessageEntityType as BotEntityType
+from ftmgram.enums import MessageEntityType
 from ftmgram.enums import ParseMode as BotParseMode
 from ftmgram.handlers import CallbackQueryHandler
 from ftmgram.handlers import MessageHandler as BotMessageHandler
@@ -25,8 +25,7 @@ from ftmgram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message as BotMessage,
-    MessageEntity as BotMessageEntity,
-    MessageEntityCustomEmoji,
+    MessageEntity,
 )
 
 # Kurigram is used strictly for temporary userbot auth/validation clients
@@ -99,10 +98,10 @@ def utf16_len(s: str) -> int:
 
 def build_message(
     pairs: list[tuple[str, int]], sep: str = " "
-) -> tuple[str, list[MessageEntityCustomEmoji]]:
+) -> tuple[str, list[MessageEntity]]:
     """Build a Premium Custom Emoji message from (emoji, custom_emoji_id) pairs."""
     text = ""
-    entities: list[MessageEntityCustomEmoji] = []
+    entities: list[MessageEntity] = []
     offset = 0
     for i, (emoji, cid) in enumerate(pairs):
         if i > 0:
@@ -110,7 +109,8 @@ def build_message(
             offset += utf16_len(sep)
         length = utf16_len(emoji)
         entities.append(
-            MessageEntityCustomEmoji(
+            MessageEntity(
+                type=MessageEntityType.CUSTOM_EMOJI,
                 offset=offset,
                 length=length,
                 custom_emoji_id=int(cid),
@@ -122,11 +122,11 @@ def build_message(
 
 
 class RichText:
-    """Composes NexaPilot bot text with exact UTF-16 MessageEntityCustomEmoji spans."""
+    """Composes NexaPilot bot text with exact UTF-16 CUSTOM_EMOJI MessageEntity spans."""
 
     def __init__(self) -> None:
         self._parts: list[str] = []
-        self._entities: list[Any] = []
+        self._entities: list[MessageEntity] = []
         self._offset: int = 0
 
     def add(self, text: str) -> "RichText":
@@ -143,7 +143,8 @@ class RichText:
             cid = custom_emoji_id or BOT_EMOJI_MAP["spark"][1]
         length = utf16_len(char)
         self._entities.append(
-            MessageEntityCustomEmoji(
+            MessageEntity(
+                type=MessageEntityType.CUSTOM_EMOJI,
                 offset=self._offset,
                 length=length,
                 custom_emoji_id=int(cid),
@@ -160,7 +161,7 @@ class RichText:
             self.add(text)
         return self.add("\n")
 
-    def build(self) -> tuple[str, list[Any]]:
+    def build(self) -> tuple[str, list[MessageEntity]]:
         return "".join(self._parts).rstrip("\n"), self._entities
 
 
@@ -184,7 +185,7 @@ def serialize_bot_entities(
             continue
 
         ent_type = getattr(ent, "type", None)
-        if isinstance(ent, MessageEntityCustomEmoji) or (
+        if ent_type == MessageEntityType.CUSTOM_EMOJI or (
             ent_type is not None and getattr(ent_type, "name", "") == "CUSTOM_EMOJI"
         ):
             type_name = "CUSTOM_EMOJI"
@@ -214,11 +215,11 @@ def serialize_bot_entities(
 
 def deserialize_to_ftmgram_entities(
     entities_json: list[dict[str, Any]] | None,
-) -> list[Any]:
-    """Convert stored JSONB entities into ftmgram MessageEntityCustomEmoji / MessageEntity objects."""
+) -> list[MessageEntity]:
+    """Convert stored JSONB entities into ftmgram MessageEntity objects."""
     if not entities_json:
         return []
-    out: list[Any] = []
+    out: list[MessageEntity] = []
     for raw in entities_json:
         tname = str(raw.get("type", "")).upper()
         offset = int(raw.get("offset", 0))
@@ -227,17 +228,18 @@ def deserialize_to_ftmgram_entities(
             continue
         if tname == "CUSTOM_EMOJI" and raw.get("custom_emoji_id") is not None:
             out.append(
-                MessageEntityCustomEmoji(
+                MessageEntity(
+                    type=MessageEntityType.CUSTOM_EMOJI,
                     offset=offset,
                     length=length,
                     custom_emoji_id=int(raw["custom_emoji_id"]),
                 )
             )
             continue
-        if tname in ("TEXT_MENTION", "UNKNOWN") or not hasattr(BotEntityType, tname):
+        if tname in ("TEXT_MENTION", "UNKNOWN") or not hasattr(MessageEntityType, tname):
             continue
         kwargs: dict[str, Any] = {
-            "type": getattr(BotEntityType, tname),
+            "type": getattr(MessageEntityType, tname),
             "offset": offset,
             "length": length,
         }
@@ -246,7 +248,7 @@ def deserialize_to_ftmgram_entities(
         if raw.get("language"):
             kwargs["language"] = str(raw["language"])
         try:
-            out.append(BotMessageEntity(**kwargs))
+            out.append(MessageEntity(**kwargs))
         except Exception:
             continue
     return out
