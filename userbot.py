@@ -1452,6 +1452,71 @@ class UserbotManager:
             except Exception as exc:
                 logger.warning("Error stopping client for user_id=%s: %s", telegram_user_id, exc)
 
+    async def logout_and_disconnect_client(self, telegram_user_id: int) -> bool:
+        """
+        Fully disconnect an account:
+        1. Stop running campaigns & mark them stopped in Supabase.
+        2. Remove APScheduler jobs & deactivate scheduled_posts in Supabase.
+        3. Disable mention, welcome, and offline auto-replies.
+        4. Call client.log_out() on the active Kurigram client so Telegram
+           terminates the session from Settings -> Devices / Active Sessions.
+        5. Clean up in-memory client registry & caches.
+        Returns True if Telegram log_out() succeeded cleanly, False otherwise.
+        """
+        # 1. Cancel & mark running campaigns stopped
+        for cmp_id, (owner_id, task) in list(self._campaign_tasks.items()):
+            if owner_id == telegram_user_id:
+                self._campaign_tasks.pop(cmp_id, None)
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                try:
+                    await self.db.update_campaign(cmp_id, {"status": "stopped"}, telegram_user_id)
+                except Exception as exc:
+                    logger.warning("Failed to mark campaign %s stopped on logout: %s", cmp_id, exc)
+
+        # 2. Remove APScheduler jobs & deactivate scheduled_posts
+        try:
+            active_jobs = await self.db.list_active_scheduled_posts(telegram_user_id)
+            for row in active_jobs:
+                job_id = int(row["id"])
+                sched_id = f"sched_{job_id}"
+                if self.scheduler.get_job(sched_id):
+                    self.scheduler.remove_job(sched_id)
+                await self.db.deactivate_scheduled_post(job_id, telegram_user_id)
+        except Exception as exc:
+            logger.warning("Error cleaning up scheduled jobs on logout for user=%s: %s", telegram_user_id, exc)
+
+        # 3. Disable auto-replies in DB
+        try:
+            await self.db.set_mention_config(telegram_user_id, enabled=False)
+            await self.db.set_welcome_config(telegram_user_id, enabled=False)
+            await self.db.set_offline_config(telegram_user_id, enabled=False)
+        except Exception as exc:
+            logger.warning("Error disabling auto-replies on logout for user=%s: %s", telegram_user_id, exc)
+
+        # 4. Real Telegram device logout via Kurigram client.log_out()
+        logged_out_remotely = False
+        client = self.active_clients.get(telegram_user_id)
+        if client is not None:
+            try:
+                await client.log_out()
+                logged_out_remotely = True
+                logger.info("Telegram device log_out() succeeded for user_id=%s", telegram_user_id)
+            except Exception as exc:
+                logger.warning(
+                    "Telegram log_out() failed or session already revoked for user_id=%s: %s",
+                    telegram_user_id,
+                    exc,
+                )
+
+        # 5. Clean up registry & caches (and stop client if still connected)
+        await self.stop_client(telegram_user_id)
+        return logged_out_remotely
+
     async def stop_all_clients(self) -> None:
         user_ids = list(self.active_clients.keys())
         for user_id in user_ids:
